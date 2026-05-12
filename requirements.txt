@@ -1,7 +1,0 @@
-# Tshark-tools 依赖
-# 核心依赖 (仅有 PyYAML 为可选)
-pyyaml>=6.0
-
-# TShark 需单独安装 (Wireshark 附带)
-# Windows: https://www.wireshark.org/download.html
-# Linux:   sudo apt install tshark  /  sudo yum install wireshark-cli
