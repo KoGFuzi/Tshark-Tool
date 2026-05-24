@@ -6,7 +6,9 @@ Extracts files from pcap using various methods:
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from core.exceptions import TsharkToolError
 from core.tshark_wrapper import filter_packets
 from core.utils import detect_file_type, hex_dump_to_bytes
 
@@ -105,12 +107,16 @@ def extract_zip_from_pcap(pcap: str, output_dir: str) -> list[str]:
         "ftp-data and data.data contains 50:4b:03:04",
     ]
 
-    for dfilter in filters:
+    def _extract_one(dfilter: str) -> list[str]:
         try:
-            files = extract_hex_from_filter(pcap, dfilter, output_dir)
-            saved.extend(files)
-        except RuntimeError:
-            continue
+            return extract_hex_from_filter(pcap, dfilter, output_dir)
+        except TsharkToolError:
+            return []
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(_extract_one, f): f for f in filters}
+        for future in as_completed(futures):
+            saved.extend(future.result())
 
     return saved
 

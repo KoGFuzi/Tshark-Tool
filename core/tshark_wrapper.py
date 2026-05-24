@@ -16,6 +16,8 @@ if platform.system() == "Windows":
 else:
     TSHARK_PATH = "tshark"
 
+_TSHARK_TIMEOUT = 120  # seconds
+
 
 # ─── Core Execution ──────────────────────────────────────────────────
 
@@ -51,8 +53,14 @@ def _tshark_exec(args: tuple[str, ...]) -> str:
             encoding="utf-8",
             errors="replace",
             check=True,
+            timeout=_TSHARK_TIMEOUT,
         )
         return proc.stdout
+    except subprocess.TimeoutExpired as e:
+        raise TsharkExecutionError(
+            returncode=-1,
+            stderr=f"tshark timed out after {_TSHARK_TIMEOUT}s",
+        ) from e
     except subprocess.CalledProcessError as e:
         raise TsharkExecutionError(
             returncode=e.returncode,
@@ -76,6 +84,7 @@ def tshark_version() -> str:
             encoding="utf-8",
             errors="replace",
             check=True,
+            timeout=10,
         )
         first_line = proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else ""
         return first_line or "unknown"
@@ -227,3 +236,33 @@ def extract_raw_field(pcap: str, display_filter: str, field: str) -> list[str]:
         "-e", field,
     ])
     return [line.strip() for line in out.strip().splitlines() if line.strip()]
+
+
+def parse_tshark_fields(raw: str, field_names: list[str]) -> list[dict[str, str]]:
+    """Parse tshark ``-T fields`` tab-delimited output into structured dicts.
+
+    The first column (frame number) is always mapped to ``"frame"``.
+    Subsequent columns are mapped to *field_names* in order.
+
+    Args:
+        raw: Raw tshark ``-T fields`` stdout.
+        field_names: Semantic names for columns after the frame number.
+
+    Returns:
+        List of dicts with keys ``"frame"`` plus *field_names*.
+    """
+    entries: list[dict[str, str]] = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if not parts or not parts[0].isdigit():
+            continue
+        entry: dict[str, str] = {"frame": parts[0]}
+        for i, name in enumerate(field_names):
+            idx = i + 1
+            if len(parts) > idx and parts[idx]:
+                entry[name] = parts[idx]
+        entries.append(entry)
+    return entries

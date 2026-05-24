@@ -22,6 +22,7 @@ from core.tshark_wrapper import (
     follow_stream,
     get_pcap_info,
     list_protocols,
+    parse_tshark_fields,
     tshark_version,
 )
 from core.utils import (
@@ -52,6 +53,7 @@ __all__ = [
     # Tshark wrapper
     "get_pcap_info",
     "list_protocols",
+    "parse_tshark_fields",
     "tshark_version",
     "filter_packets",
     "follow_stream",

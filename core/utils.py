@@ -1,14 +1,15 @@
 """
 Utility functions: hex decoding, base64, zip cracking, file type detection.
 
-All functions in this module are pure-Python with no external dependencies
-(no tshark required).
+Pure-Python with no tshark dependency.  Requires pyzipper for AES zip support.
 """
 
 import base64
 import itertools
 import string
 import zipfile
+import zlib
+import pyzipper
 from typing import Callable, Optional
 
 from core.exceptions import Base64DecodeError, HexDecodeError
@@ -107,6 +108,44 @@ def bytes_to_hex_dump(data: bytes, width: int = 16) -> str:
     return "\n".join(result)
 
 
+# ─── Stream data extraction ───────────────────────────────────────
+
+
+def extract_follow_stream_data(raw: str) -> Optional[bytes]:
+    """Extract raw bytes from 'follow stream' tshark hex output.
+
+    The follow stream output uses ``===`` separators to delimit the data
+    section. Lines inside contain hex dumps like::
+
+        00000000  50 4b 03 04 ...
+
+    Args:
+        raw: Raw tshark -z follow,... hex output.
+
+    Returns:
+        Decoded bytes, or None if no data found.
+    """
+    hex_str = ""
+    capture = False
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("=" * 3):
+            capture = not capture
+            continue
+        if capture and stripped:
+            parts = stripped.split()
+            hex_tokens = [p for p in parts if len(p) == 2 and is_hex(p)]
+            if hex_tokens:
+                hex_str += "".join(hex_tokens)
+
+    if hex_str:
+        try:
+            return bytes.fromhex(hex_str)
+        except ValueError:
+            return None
+    return None
+
+
 # ─── File type detection ──────────────────────────────────────────
 
 _FILE_SIGNATURES: list[tuple[bytes, str, str]] = [
@@ -180,6 +219,9 @@ def try_unzip(
 
     Supports both traditional ZipCrypto (via stdlib) and AES (via optional pyzipper).
 
+    Validates the password against the first file entry before reading all files,
+    which significantly speeds up brute-force attacks.
+
     Args:
         zip_path: Path to zip file.
         password: Password string (or None for no password).
@@ -192,37 +234,54 @@ def try_unzip(
     # Try 1: standard zipfile (handles ZipCrypto)
     try:
         with zipfile.ZipFile(zip_path, "r") as zf:
+            names = zf.namelist()
+            if not names:
+                return None
+            # Early validation: test password on the first entry with CRC check
+            try:
+                test_data = zf.read(names[0], pwd=pwd)
+                info = zf.getinfo(names[0])
+                if info.CRC != 0 and zlib.crc32(test_data) != info.CRC:
+                    return None
+            except NotImplementedError:
+                raise  # AES encrypted, fall through to pyzipper (Try 2)
+            except (RuntimeError, zipfile.BadZipFile):
+                return None
+            # Password valid — read all files
             contents: list[tuple[str, bytes]] = []
-            for name in zf.namelist():
+            for name in names:
                 try:
                     data = zf.read(name, pwd=pwd)
                     contents.append((name, data))
                 except (RuntimeError, zipfile.BadZipFile):
                     continue
-            if contents:
-                return contents
+            return contents if contents else None
     except (FileNotFoundError, zipfile.BadZipFile):
         return None
     except Exception:
         pass  # Fall through to pyzipper
 
-    # Try 2: optional pyzipper (handles AES-encrypted zips)
+    # Try 2: pyzipper (handles AES-encrypted zips)
     try:
-        import pyzipper
-
         with pyzipper.AESZipFile(zip_path, "r") as zf:
             zf.setpassword(pwd or b"")
-            contents = []
-            for name in zf.namelist():
+            names = zf.namelist()
+            if not names:
+                return None
+            # Early validation: test password on the first entry only
+            try:
+                zf.read(names[0])
+            except Exception:
+                return None
+            # Password valid — read all files
+            contents: list[tuple[str, bytes]] = []
+            for name in names:
                 try:
                     data = zf.read(name)
                     contents.append((name, data))
                 except Exception:
                     continue
-            if contents:
-                return contents
-    except ImportError:
-        pass
+            return contents if contents else None
     except Exception:
         pass
 

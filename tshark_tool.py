@@ -12,6 +12,8 @@ Commands:
     info      Show pcap file information
     ftp       Analyze FTP traffic
     http      Analyze HTTP traffic
+    dns       Analyze DNS traffic
+    udp       Analyze UDP traffic
     all       Full analysis of all protocols
     extract   Extract files from pcap
     hex       Hex dump <-> binary conversion
@@ -25,11 +27,12 @@ import base64
 import os
 import sys
 import re
+import zipfile as zf_mod
 from typing import Optional
-from core.exceptions import PcapNotFoundError, TsharkToolError
+from core.exceptions import PcapNotFoundError, TsharkToolError, Base64DecodeError
 from core.logconfig import get_logger, setup_logging
 from core.tshark_wrapper import (
-    get_pcap_info, list_protocols, tshark_version, filter_packets,
+    list_protocols, tshark_version, filter_packets,
     extract_raw_field, export_objects,
 )
 from core.utils import (
@@ -44,6 +47,8 @@ from modules.http_analyzer import (
     extract_post_data, extract_response_data, summary as http_summary,
     _analyze_post_requests,
 )
+from modules.dns_analyzer import extract_dns_data, summary as dns_summary
+from modules.udp_analyzer import extract_udp_streams, summary as udp_summary
 from modules.extractor import (
     extract_zip_from_pcap,
     extract_hex_from_filter,
@@ -104,6 +109,19 @@ Examples:
     p_all.add_argument("pcap", help="Path to pcap/pcapng file")
     p_all.add_argument("--output", "-o", default="./extracted", help="Output directory (default: ./extracted)")
     p_all.add_argument("--extract", "-e", action="store_true", help="Extract all files found")
+
+    # ── dns ──
+    p_dns = subparsers.add_parser("dns", help="Analyze DNS traffic")
+    p_dns.add_argument("pcap", help="Path to pcap/pcapng file")
+    p_dns.add_argument("--extract", "-e", action="store_true", help="Extract DNS TXT/hex records")
+    p_dns.add_argument("--output", "-o", default="./extracted", help="Output directory (default: ./extracted)")
+
+    # ── udp ──
+    p_udp = subparsers.add_parser("udp", help="Analyze UDP traffic")
+    p_udp.add_argument("pcap", help="Path to pcap/pcapng file")
+    p_udp.add_argument("--extract", "-e", action="store_true", help="Extract UDP stream data")
+    p_udp.add_argument("--output", "-o", default="./extracted", help="Output directory (default: ./extracted)")
+    p_udp.add_argument("--stream", "-s", type=int, help="Specific UDP stream index to follow")
 
     # ── extract ──
     p_extract = subparsers.add_parser("extract", help="Extract files from pcap or convert data")
@@ -179,14 +197,10 @@ def _print_ftp_file(r: dict, indent: str = ""):
 
 def cmd_info(pcap: str):
     """Show pcap file information."""
-    if not os.path.isfile(pcap):
-        print(f"[!] File not found: {pcap}")
-        sys.exit(1)
+    check_pcap(pcap)
 
     print(f"[*] File: {os.path.abspath(pcap)}")
     print(f"[*] Size: {os.path.getsize(pcap):,} bytes")
-
-    get_pcap_info(pcap)
     print(f"\n[*] TShark version: {tshark_version()}")
     print("\n[*] Protocol Hierarchy:")
     print(list_protocols(pcap))
@@ -233,53 +247,123 @@ def cmd_http(pcap: str, extract: bool = False, output: str = "./extracted", extr
                 print(f"    {f} ({size:,} bytes)")
 
 
+def _print_extraction_results(ftp_results, zips, http_files, post_files, resp_files,
+                               dns_files=None, udp_results=None, indent=""):
+    """Print extraction result summaries."""
+    if ftp_results:
+        print(f"{indent}[+] FTP files: {len(ftp_results)}")
+        for r in ftp_results:
+            _print_ftp_file(r, indent=indent + "  ")
+            if r.get("preview"):
+                for line in r["preview"].splitlines()[:3]:
+                    print(f"{indent}      | {line}")
+    if zips:
+        print(f"{indent}[+] ZIP files: {len(zips)}")
+        for z in zips:
+            print(f"{indent}  - {z}")
+    if http_files:
+        print(f"{indent}[+] HTTP objects: {len(http_files)}")
+        for f in http_files:
+            print(f"{indent}  - {f}")
+    if post_files:
+        print(f"{indent}[+] POST data files: {len(post_files)}")
+    if resp_files:
+        print(f"{indent}[+] HTTP response files: {len(resp_files)}")
+    if dns_files:
+        print(f"{indent}[+] DNS data files: {len(dns_files)}")
+        for f in dns_files:
+            print(f"{indent}  - {f}")
+    if udp_results:
+        print(f"{indent}[+] UDP streams: {len(udp_results)}")
+        for r in udp_results:
+            path = r.get("path", "")
+            if path:
+                print(f"{indent}  stream {r['stream']}: {os.path.basename(path)} [{r['type']}] ({r['size']:,} bytes)")
+
+
+def _do_extract(pcap: str, output: str) -> tuple:
+    """Run all extraction operations and return results."""
+    os.makedirs(output, exist_ok=True)
+
+    ftp_results = extract_all_ftp_data(pcap, os.path.join(output, "ftp"))
+    zips = extract_zip_from_pcap(pcap, os.path.join(output, "zips"))
+
+    http_files = []
+    try:
+        http_files = export_objects(pcap, "http", os.path.join(output, "http_objects"))
+    except TsharkToolError:
+        pass
+
+    post_files = extract_post_data(pcap, os.path.join(output, "http_post"))
+    resp_files = extract_response_data(pcap, os.path.join(output, "http_response"))
+
+    dns_files = extract_dns_data(pcap, os.path.join(output, "dns"))
+    udp_results = extract_udp_streams(pcap, os.path.join(output, "udp"))
+
+    return ftp_results, zips, http_files, post_files, resp_files, dns_files, udp_results
+
+
 def cmd_all(pcap: str, output: str = "./extracted", extract: bool = False):
     """Full analysis of all protocols."""
     check_pcap(pcap)
     print(f"[*] Full analysis of: {pcap}")
     print(f"[*] TShark: {tshark_version()}\n")
 
-    # Protocol hierarchy
     print(list_protocols(pcap))
-
-    # FTP summary
     print(ftp_summary(pcap))
     print()
-
-    # HTTP summary
     print(http_summary(pcap))
+    print()
+    print(dns_summary(pcap))
+    print()
+    print(udp_summary(pcap))
     print()
 
     if extract:
-        os.makedirs(output, exist_ok=True)
         print(f"[*] Extracting to: {output}")
+        ftp_results, zips, http_files, post_files, resp_files, dns_files, udp_results = _do_extract(pcap, output)
+        _print_extraction_results(ftp_results, zips, http_files, post_files, resp_files,
+                                   dns_files, udp_results, indent="  ")
 
-        # Extract FTP data
-        ftp_results = extract_all_ftp_data(pcap, os.path.join(output, "ftp"))
-        if ftp_results:
-            print(f"  [+] FTP files extracted: {len(ftp_results)}")
-            for r in ftp_results:
-                _print_ftp_file(r, indent="      ")
+
+def cmd_dns(pcap: str, extract: bool = False, output: str = "./extracted"):
+    """Analyze DNS traffic."""
+    check_pcap(pcap)
+    print(dns_summary(pcap))
+
+    if extract:
+        os.makedirs(output, exist_ok=True)
+        files = extract_dns_data(pcap, output)
+        if files:
+            print(f"\n[+] DNS data extracted to: {output}")
+            for f in files:
+                size = os.path.getsize(f)
+                print(f"    {f} ({size:,} bytes)")
+        else:
+            print("\n[-] No DNS data extracted.")
+
+
+def cmd_udp(pcap: str, extract: bool = False, output: str = "./extracted", stream: int = None):
+    """Analyze UDP traffic."""
+    check_pcap(pcap)
+    print(udp_summary(pcap))
+
+    if extract:
+        os.makedirs(output, exist_ok=True)
+        if stream is not None:
+            print(f"\n[*] Extracting UDP stream {stream}...")
+        results = extract_udp_streams(pcap, output, stream_filter=stream)
+        if results:
+            print(f"\n[+] Extracted {len(results)} UDP stream(s):")
+            for r in results:
+                path = r.get("path", "")
+                if path:
+                    print(f"    stream {r['stream']}: {os.path.basename(path)} [{r['type']}] ({r['size']:,} bytes)")
                 if r.get("preview"):
                     for line in r["preview"].splitlines()[:3]:
-                        print(f"          | {line}")
-
-        # Extract ZIPs
-        zips = extract_zip_from_pcap(pcap, output)
-        if zips:
-            print(f"  [+] ZIP files found: {len(zips)}")
-            for z in zips:
-                print(f"      - {z}")
-
-        # Extract HTTP objects
-        try:
-            http_files = export_objects(pcap, "http", os.path.join(output, "http_objects"))
-            if http_files:
-                print(f"  [+] HTTP objects: {len(http_files)}")
-                for f in http_files:
-                    print(f"      - {f}")
-        except RuntimeError:
-            pass
+                        print(f"        | {line}")
+        else:
+            print("\n[-] No UDP stream data extracted.")
 
 
 def cmd_extract_zip_from_pcap(pcap: str, output: str = "./extracted"):
@@ -333,7 +417,7 @@ def cmd_base64(string: str, output: Optional[str] = None):
     """Base64 decode."""
     try:
         data = decode_base64(string)
-    except ValueError as e:
+    except Base64DecodeError as e:
         print(f"[!] Error: {e}")
         sys.exit(1)
 
@@ -380,10 +464,8 @@ def cmd_zip_info(zip_path: str, password: Optional[str] = None):
         print(f"[!] File not found: {zip_path}")
         sys.exit(1)
 
-    import zipfile as zf_mod
     try:
         with zf_mod.ZipFile(zip_path, "r") as zf:
-            password.encode() if password else None
             print(f"[*] ZIP file: {os.path.abspath(zip_path)}")
             print(f"[*] Number of entries: {len(zf.namelist())}")
             for info in zf.infolist():
@@ -397,6 +479,7 @@ def cmd_zip_info(zip_path: str, password: Optional[str] = None):
                 print(f"  {flag} {info.filename:30s} {size:>8,d} -> {compress:>8,d}  (crc={crc})")
     except (RuntimeError, zf_mod.BadZipFile) as e:
         print(f"[!] Error: {e}")
+        sys.exit(1)
 
 
 def cmd_zip_crack(zip_path: str, max_len: int = 4, chars: str = "0123456789", wordlist: Optional[str] = None):
@@ -444,7 +527,6 @@ def cmd_zip_crack(zip_path: str, max_len: int = 4, chars: str = "0123456789", wo
 def cmd_analyze(pcap: str, output: str = "./extracted"):
     """One-stop: analyze all protocols and extract everything."""
     check_pcap(pcap)
-    os.makedirs(output, exist_ok=True)
 
     print("=" * 60)
     print(" Tshark-tool -- One-Stop Analysis")
@@ -454,57 +536,29 @@ def cmd_analyze(pcap: str, output: str = "./extracted"):
     print(f" TShark: {tshark_version()}")
     print()
 
-    # 1. Protocol hierarchy
-    print("[1/5] Protocol hierarchy...")
+    print("[1/7] Protocol hierarchy...")
     print(list_protocols(pcap))
 
-    # 2. FTP analysis
-    print("\n[2/5] Analyzing FTP...")
+    print("\n[2/7] Analyzing FTP...")
     print(ftp_summary(pcap))
 
-    # 3. HTTP analysis
-    print("\n[3/5] Analyzing HTTP...")
+    print("\n[3/7] Analyzing HTTP...")
     print(http_summary(pcap))
 
-    # 4. Extract files
-    print("\n[4/5] Extracting files...")
-    # FTP data
-    ftp_results = extract_all_ftp_data(pcap, os.path.join(output, "ftp"))
-    if ftp_results:
-        print(f"  [+] Extracted {len(ftp_results)} FTP file(s)")
-        for r in ftp_results:
-            _print_ftp_file(r, indent="      ")
-            if r.get("preview"):
-                for line in r["preview"].splitlines()[:3]:
-                    print(f"          | {line}")
-    # ZIP files
-    zips = extract_zip_from_pcap(pcap, os.path.join(output, "zips"))
-    if zips:
-        print(f"  [+] Extracted {len(zips)} ZIP file(s)")
-        for z in zips:
-            print(f"      {z}")
-    # HTTP objects
-    try:
-        http_files = export_objects(pcap, "http", os.path.join(output, "http_objects"))
-        if http_files:
-            print(f"  [+] Extracted {len(http_files)} HTTP object(s)")
-            for f in http_files:
-                print(f"      {f}")
-    except RuntimeError:
-        pass
-    # POST data
-    post_files = extract_post_data(pcap, os.path.join(output, "http_post"))
-    if post_files:
-        print(f"  [+] Extracted {len(post_files)} POST data file(s)")
-    # Response data
-    resp_files = extract_response_data(pcap, os.path.join(output, "http_response"))
-    if resp_files:
-        print(f"  [+] Extracted {len(resp_files)} HTTP response file(s)")
+    print("\n[4/7] Analyzing DNS...")
+    print(dns_summary(pcap))
 
-    # 5. Sensitive info & Summary
-    print("\n[5/5] Scanning for sensitive information...")
+    print("\n[5/7] Analyzing UDP...")
+    print(udp_summary(pcap))
+
+    print("\n[6/7] Extracting files...")
+    ftp_results, zips, http_files, post_files, resp_files, dns_files, udp_results = _do_extract(pcap, output)
+    _print_extraction_results(ftp_results, zips, http_files, post_files, resp_files,
+                               dns_files, udp_results, indent="    ")
+
+    print("\n[7/7] Scanning for sensitive information...")
     _scan_sensitive_info(pcap, output, ftp_results)
-    print("\n[5/5] Analysis complete!")
+    print("\n[7/7] Analysis complete!")
     print(f" All extracted files are in: {os.path.abspath(output)}")
 
 
@@ -545,7 +599,7 @@ def _scan_sensitive_info(pcap: str, output_dir: str, ftp_results: list):
                             print(f"      {line}")
             except Exception:
                 pass
-    except RuntimeError:
+    except TsharkToolError:
         pass
 
     # 3. Base64-like strings in plaintext HTTP responses
@@ -576,7 +630,7 @@ def _scan_sensitive_info(pcap: str, output_dir: str, ftp_results: list):
                 # Show first 80 chars with preview
                 preview = s[:80]
                 print(f"      {preview}")
-    except RuntimeError:
+    except TsharkToolError:
         pass
 
     # 4. Non-200 HTTP response codes (potential errors/interesting info)
@@ -595,7 +649,7 @@ def _scan_sensitive_info(pcap: str, output_dir: str, ftp_results: list):
                 code = parts[1] if len(parts) > 1 else "?"
                 phrase = parts[2] if len(parts) > 2 else ""
                 print(f"      #[{fid}] {code} {phrase}")
-    except RuntimeError:
+    except TsharkToolError:
         pass
 
 
@@ -619,53 +673,64 @@ def main():
         sys.exit(1)
 
     try:
-        if args.command == "info":
-            cmd_info(args.pcap)
-        elif args.command == "ftp":
-            cmd_ftp(args.pcap, extract=getattr(args, "extract", False))
-        elif args.command == "http":
-            cmd_http(args.pcap, extract=getattr(args, "extract", False),
-                     output=getattr(args, "output", "./extracted"),
-                     extra_filter=getattr(args, "filter", ""))
-        elif args.command == "all":
-            cmd_all(args.pcap, output=getattr(args, "output", "./extracted"),
-                    extract=getattr(args, "extract", False))
-        elif args.command == "extract":
-            if not args.extract_type:
-                print("[!] Specify extraction type: zip, hex, hex-file, filter")
-                sys.exit(1)
-            if args.extract_type == "zip":
-                cmd_extract_zip_from_pcap(args.pcap, getattr(args, "output", "./extracted"))
-            elif args.extract_type == "hex":
-                cmd_extract_hex(args.hex_string, args.output)
-            elif args.extract_type == "hex-file":
-                cmd_extract_hex_file(args.hex_file, args.output)
-            elif args.extract_type == "filter":
-                cmd_extract_filter(args.pcap, args.filter_expr,
-                                   getattr(args, "output", "./extracted"),
-                                   getattr(args, "field", "data.data"))
-        elif args.command == "base64":
-            cmd_base64(args.string, getattr(args, "output", None))
-        elif args.command == "hex":
-            if not args.hex_type:
-                print("[!] Specify hex operation: decode, dump")
-                sys.exit(1)
-            if args.hex_type == "decode":
-                cmd_hex_decode(args.hex_string)
-            elif args.hex_type == "dump":
-                cmd_hex_dump(args.file)
-        elif args.command == "zip":
-            if not args.zip_type:
-                print("[!] Specify zip operation: info, crack")
-                sys.exit(1)
-            if args.zip_type == "info":
-                cmd_zip_info(args.zipfile, getattr(args, "password", None))
-            elif args.zip_type == "crack":
-                cmd_zip_crack(args.zipfile, getattr(args, "max_len", 4),
-                              getattr(args, "chars", "0123456789"),
-                              getattr(args, "wordlist", None))
-        elif args.command == "analyze":
-            cmd_analyze(args.pcap, getattr(args, "output", "./extracted"))
+        match args.command:
+            case "info":
+                cmd_info(args.pcap)
+            case "ftp":
+                cmd_ftp(args.pcap, extract=getattr(args, "extract", False))
+            case "http":
+                cmd_http(args.pcap, extract=getattr(args, "extract", False),
+                         output=getattr(args, "output", "./extracted"),
+                         extra_filter=getattr(args, "filter", ""))
+            case "all":
+                cmd_all(args.pcap, output=getattr(args, "output", "./extracted"),
+                        extract=getattr(args, "extract", False))
+            case "dns":
+                cmd_dns(args.pcap, extract=getattr(args, "extract", False),
+                        output=getattr(args, "output", "./extracted"))
+            case "udp":
+                cmd_udp(args.pcap, extract=getattr(args, "extract", False),
+                        output=getattr(args, "output", "./extracted"),
+                        stream=getattr(args, "stream", None))
+            case "extract":
+                match args.extract_type:
+                    case "zip":
+                        cmd_extract_zip_from_pcap(args.pcap, getattr(args, "output", "./extracted"))
+                    case "hex":
+                        cmd_extract_hex(args.hex_string, args.output)
+                    case "hex-file":
+                        cmd_extract_hex_file(args.hex_file, args.output)
+                    case "filter":
+                        cmd_extract_filter(args.pcap, args.filter_expr,
+                                           getattr(args, "output", "./extracted"),
+                                           getattr(args, "field", "data.data"))
+                    case _:
+                        print("[!] Specify extraction type: zip, hex, hex-file, filter")
+                        sys.exit(1)
+            case "base64":
+                cmd_base64(args.string, getattr(args, "output", None))
+            case "hex":
+                match args.hex_type:
+                    case "decode":
+                        cmd_hex_decode(args.hex_string)
+                    case "dump":
+                        cmd_hex_dump(args.file)
+                    case _:
+                        print("[!] Specify hex operation: decode, dump")
+                        sys.exit(1)
+            case "zip":
+                match args.zip_type:
+                    case "info":
+                        cmd_zip_info(args.zipfile, getattr(args, "password", None))
+                    case "crack":
+                        cmd_zip_crack(args.zipfile, getattr(args, "max_len", 4),
+                                      getattr(args, "chars", "0123456789"),
+                                      getattr(args, "wordlist", None))
+                    case _:
+                        print("[!] Specify zip operation: info, crack")
+                        sys.exit(1)
+            case "analyze":
+                cmd_analyze(args.pcap, getattr(args, "output", "./extracted"))
 
     except TsharkToolError as e:
         logger.error(str(e))

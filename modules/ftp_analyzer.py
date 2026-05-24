@@ -7,8 +7,9 @@ import os
 import re
 from typing import Any, Optional
 
-from core.tshark_wrapper import filter_packets, follow_stream, extract_raw_field
-from core.utils import detect_file_type, is_hex
+from core.exceptions import TsharkToolError
+from core.tshark_wrapper import filter_packets, follow_stream, extract_raw_field, parse_tshark_fields
+from core.utils import detect_file_type, extract_follow_stream_data
 
 
 def analyze_ftp(pcap: str) -> dict[str, Any]:
@@ -36,7 +37,7 @@ def analyze_ftp(pcap: str) -> dict[str, Any]:
         fields=["frame.number", "ftp.request.command", "ftp.request.arg",
                 "ftp.response.code", "ftp.response.arg"],
     )
-    result["sessions"] = _parse_ftp_lines(raw)
+    result["sessions"] = parse_tshark_fields(raw, ["command", "arg", "response_code", "response_arg"])
 
     # ── Find login credentials ──
     creds = _find_credentials(raw)
@@ -59,43 +60,6 @@ def analyze_ftp(pcap: str) -> dict[str, Any]:
     result["files"] = [f for f in filenames if f]
 
     return result
-
-
-def _parse_ftp_lines(raw: str) -> list[dict[str, str]]:
-    """Parse tshark field output into structured sessions.
-
-    tshark -T fields output uses tab separators with positional fields.
-    Missing trailing fields produce empty strings.
-
-    Expected layout:
-        frame_number \\t command \\t arg \\t response_code \\t response_arg
-    """
-    sessions: list[dict[str, str]] = []
-    for line in raw.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-
-        parts = line.split("\t")
-        entry: dict[str, str] = {}
-
-        # First column must be a frame number to be valid
-        if not parts or not parts[0].isdigit():
-            continue
-        entry["frame"] = parts[0]
-
-        # Remaining fields are positional
-        if len(parts) > 1 and parts[1]:
-            entry["command"] = parts[1]
-        if len(parts) > 2 and parts[2]:
-            entry["arg"] = parts[2]
-        if len(parts) > 3 and parts[3]:
-            entry["response_code"] = parts[3]
-        if len(parts) > 4 and parts[4]:
-            entry["response_arg"] = parts[4]
-
-        sessions.append(entry)
-    return sessions
 
 
 def _find_credentials(raw: str) -> list[tuple[str, str]]:
@@ -221,7 +185,7 @@ def extract_all_ftp_data(pcap: str, output_dir: str) -> list[dict[str, Any]]:
                 info = _try_stream(idx)
                 if info:
                     results.append(info)
-            except RuntimeError:
+            except TsharkToolError:
                 continue
 
     return results
@@ -239,40 +203,9 @@ def _extract_ftp_data_bytes(pcap: str, stream_index: int) -> Optional[bytes]:
     """
     try:
         raw_data = follow_stream(pcap, "tcp", stream_index, mode="hex")
-    except RuntimeError:
+    except TsharkToolError:
         return None
-    return _extract_follow_stream_data(raw_data)
-
-
-def _extract_follow_stream_data(raw: str) -> Optional[bytes]:
-    """Extract raw bytes from 'follow stream' tshark output.
-
-    The follow stream output uses ``===`` separators to delimit the data
-    section. Lines inside contain hex dumps like:
-
-        "00000000  50 4b 03 04 ..."
-    """
-    hex_str = ""
-    capture = False
-    for line in raw.splitlines():
-        stripped = line.strip()
-        # "===" markers delimit the data section
-        if stripped.startswith("=" * 3):
-            capture = not capture
-            continue
-        if capture and stripped:
-            # Extract hex bytes: "000000A0  50 4b 03 04 ...  ASCII"
-            parts = stripped.split()
-            hex_tokens = [p for p in parts if len(p) == 2 and is_hex(p)]
-            if hex_tokens:
-                hex_str += "".join(hex_tokens)
-
-    if hex_str:
-        try:
-            return bytes.fromhex(hex_str)
-        except ValueError:
-            return None
-    return None
+    return extract_follow_stream_data(raw_data)
 
 
 def summary(pcap: str) -> str:
